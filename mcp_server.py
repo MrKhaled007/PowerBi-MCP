@@ -1,8 +1,15 @@
 import json
 import logging
+import os
 import sys
 from mcp.server.fastmcp import FastMCP
+from anthropic import Anthropic
+from dotenv import load_dotenv
 import mock_data as db
+
+from pathlib import Path
+load_dotenv(dotenv_path=Path(__file__).parent / ".env")
+anthropic_client = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 
 logging.basicConfig(stream=sys.stderr, level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -357,6 +364,126 @@ Please audit this report and provide:
 3. Recommendations to improve clarity, performance, or usability
 4. Suggested KPIs or visuals that might be missing based on the dataset available
 """
+
+
+
+@mcp.tool()
+async def generate_measure(dataset_id: str, description: str) -> str:
+    """Generate a DAX measure from a plain English description using the dataset schema.
+
+    Args:
+        dataset_id: The dataset ID to generate a measure for (e.g. ds-001, ds-002, ds-003).
+        description: Plain English description of what you want to measure (e.g. total exposure for high risk counterparties).
+    """
+    logger.info("Tool called: generate_measure dataset_id=%s", dataset_id)
+
+    dataset = next((d for d in db.DATASETS if d["id"] == dataset_id), None)
+    if not dataset:
+        return json.dumps({"error": f"Dataset '{dataset_id}' not found"})
+
+    schema_lines = []
+    for table in dataset["tables"]:
+        schema_lines.append(f"Table: {table['name']}")
+        for col in table["columns"]:
+            schema_lines.append(f"  - {col['name']} ({col['dataType']})")
+
+    measures = [m for m in db.MEASURES if m["datasetId"] == dataset_id]
+    measure_lines = []
+    for m in measures:
+        measure_lines.append(f"  - {m['name']}: {m['expression']}")
+
+    schema_text = "\n".join(schema_lines)
+    measure_text = "\n".join(measure_lines) if measure_lines else "  None"
+
+    prompt = f"""You are a DAX expert working with Power BI.
+A user wants to create a new DAX measure for the '{dataset['name']}' dataset.
+
+Here is the full dataset schema:
+{schema_text}
+
+Existing measures for context:
+{measure_text}
+
+User request: {description}
+
+Please provide:
+1. A DAX measure expression that fulfills the request using only the columns available in the schema above
+2. The table the measure should be placed in
+3. A plain English explanation of what the measure calculates
+4. A suggested measure name
+
+Format your response as JSON with these exact keys:
+- measure_name
+- table
+- expression
+- explanation
+
+Return only the JSON object, no markdown, no extra text."""
+
+    try:
+        response = anthropic_client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=1000,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        raw = response.content[0].text.strip()
+        result = json.loads(raw)
+        result["dataset"] = dataset["name"]
+        result["dataset_id"] = dataset_id
+        result["source"] = "live"
+        return json.dumps(result, indent=2)
+
+    except Exception as e:
+        logger.warning("Anthropic API call failed: %s — returning mock response", str(e))
+
+        mock_responses = {
+            "ds-001": {
+                "measure_name": "High Risk Counterparty Exposure",
+                "table": "FactTransactions",
+                "expression": "CALCULATE(\n    SUM(FactTransactions[ExposureEUR]),\n    FactTransactions[CreditRating] IN {\"CCC\", \"CC\", \"C\", \"D\"}\n)",
+                "explanation": "This measure sums the total EUR exposure but filters only to counterparties with sub-investment grade credit ratings (CCC, CC, C, or D). Use this to monitor concentration risk in the high risk segment of your portfolio.",
+                "dataset": dataset["name"],
+                "dataset_id": dataset_id,
+                "source": "mock",
+                "note": "Mock response — add Anthropic API credits at console.anthropic.com to enable live DAX generation",
+            },
+            "ds-002": {
+                "measure_name": "High Risk Loan Exposure",
+                "table": "FactLoans",
+                "expression": "CALCULATE(\n    SUM(FactLoans[LoanAmount]),\n    FactLoans[RiskBand] IN {\"High\", \"Very High\"}\n)",
+                "explanation": "This measure sums the total loan amount for borrowers in the High or Very High risk bands. Use this to track the concentration of risky loans in the portfolio.",
+                "dataset": dataset["name"],
+                "dataset_id": dataset_id,
+                "source": "mock",
+                "note": "Mock response — add Anthropic API credits at console.anthropic.com to enable live DAX generation",
+            },
+            "ds-003": {
+                "measure_name": "High Anomaly Fund Exposure",
+                "table": "FactFundReturns",
+                "expression": "CALCULATE(\n    COUNTROWS(FactFundReturns),\n    FactFundReturns[AnomalyScore] > 0.7\n)",
+                "explanation": "This measure counts the number of fund return observations with an anomaly score above 0.7, indicating a high likelihood of abnormal behaviour. Use this to flag funds requiring closer investigation.",
+                "dataset": dataset["name"],
+                "dataset_id": dataset_id,
+                "source": "mock",
+                "note": "Mock response — add Anthropic API credits at console.anthropic.com to enable live DAX generation",
+            },
+        }
+
+        fallback = mock_responses.get(dataset_id, {
+            "measure_name": "Generated Measure",
+            "table": dataset["tables"][0]["name"] if dataset["tables"] else "Unknown",
+            "expression": f"-- DAX expression for: {description}",
+            "explanation": f"A measure based on the description: {description}",
+            "dataset": dataset["name"],
+            "dataset_id": dataset_id,
+            "source": "mock",
+            "note": "Mock response — add Anthropic API credits at console.anthropic.com to enable live DAX generation",
+        })
+
+        return json.dumps(fallback, indent=2)
+
+
+
 
 
 # ═══════════════════════════════════════════════════════
